@@ -12,4 +12,16 @@ impl Emulator {
             memory: Mmu::new(size),
         }
     }
+
+    // Fork from the existing emulator
+    pub fn fork(&self) -> Self {
+        Self {
+            memory: self.memory.fork(),
+        }
+    }
+
+    // Reset the emulator to the state of another emulator
+    pub fn reset(&mut self, other: &Self) {
+        self.memory = other.memory.fork();
+    }
 }
