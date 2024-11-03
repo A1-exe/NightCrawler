@@ -18,6 +18,7 @@ fn main() {
     emu.memory.read_into(entry_point, &mut tmp).expect("read failed");
     
     println!("First 4 bytes at entry point: {:X?}", tmp);
+    emu.run(Some(entry_point)).expect("Run exited");
     
     // let tmp = emu.memory.alloc(6).unwrap();
     // let forked = emu.fork();

@@ -1,10 +1,211 @@
-use elf::ElfBytes;
 
 use crate::mmu::{Mmu, VirtAddr, Perm, PermBit};
+
+// An R-type instruction
+#[derive(Debug)]
+struct Rtype {
+    funct7: u32,
+    rs2:    Register,
+    rs1:    Register,
+    funct3: u32,
+    rd:     Register,
+}
+
+impl From<u32> for Rtype {
+    fn from(inst: u32) -> Self {
+        Rtype {
+            funct7: (inst >> 25) & 0b1111111,
+            rs2:    Register::from((inst >> 20) & 0b11111),
+            rs1:    Register::from((inst >> 15) & 0b11111),
+            funct3: (inst >> 12) & 0b111,
+            rd:     Register::from((inst >>  7) & 0b11111),
+        }
+    }
+}
+
+// An S-type instruction
+#[derive(Debug)]
+struct Stype {
+    imm:    i32,
+    rs2:    Register,
+    rs1:    Register,
+    funct3: u32,
+}
+
+impl From<u32> for Stype {
+    fn from(inst: u32) -> Self {
+        let imm115 = (inst >> 25) & 0b1111111;
+        let imm40  = (inst >>  7) & 0b11111;
+
+        let imm = (imm115 << 5) | imm40;
+        let imm = ((imm as i32) << 20) >> 20;
+
+        Stype {
+            imm:    imm,
+            rs2:    Register::from((inst >> 20) & 0b11111),
+            rs1:    Register::from((inst >> 15) & 0b11111),
+            funct3: (inst >> 12) & 0b111,
+        }
+    }
+}
+
+// A J-type instruction
+#[derive(Debug)]
+struct Jtype {
+    imm: i32,
+    rd:  Register,
+}
+
+impl From<u32> for Jtype {
+    fn from(inst: u32) -> Self {
+        let imm20   = (inst >> 31) & 1;
+        let imm101  = (inst >> 21) & 0b1111111111;
+        let imm11   = (inst >> 20) & 1;
+        let imm1912 = (inst >> 12) & 0b11111111;
+
+        let imm = (imm20 << 20) | (imm1912 << 12) | (imm11 << 11) |
+            (imm101 << 1);
+        let imm = ((imm as i32) << 11) >> 11;
+
+        Jtype {
+            imm: imm,
+            rd:  Register::from((inst >> 7) & 0b11111),
+        }
+    }
+}
+
+// A B-type instruction
+#[derive(Debug)]
+struct Btype {
+    imm:    i32,
+    rs2:    Register,
+    rs1:    Register,
+    funct3: u32,
+}
+
+impl From<u32> for Btype {
+    fn from(inst: u32) -> Self {
+        let imm12  = (inst >> 31) & 1;
+        let imm105 = (inst >> 25) & 0b111111;
+        let imm41  = (inst >>  8) & 0b1111;
+        let imm11  = (inst >>  7) & 1;
+
+        let imm = (imm12 << 12) | (imm11 << 11) |(imm105 << 5) | (imm41 << 1);
+        let imm = ((imm as i32) << 19) >> 19;
+
+        Btype {
+            imm:    imm,
+            rs2:    Register::from((inst >> 20) & 0b11111),
+            rs1:    Register::from((inst >> 15) & 0b11111),
+            funct3: (inst >> 12) & 0b111,
+        }
+    }
+}
+
+// An I-type instruction
+#[derive(Debug)]
+struct Itype {
+    imm:    i32,
+    rs1:    Register,
+    funct3: u32,
+    rd:     Register,
+}
+
+impl From<u32> for Itype {
+    fn from(inst: u32) -> Self {
+        Itype {
+            imm:    (inst as i32) >> 20,
+            rs1:    Register::from((inst >> 15) & 0b11111),
+            funct3: (inst >> 12) & 0b111,
+            rd:     Register::from((inst >>  7) & 0b11111),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Utype {
+    imm: i32,
+    rd:  Register,
+}
+
+impl From<u32> for Utype {
+    fn from(inst: u32) -> Self {
+        Utype {
+            imm: (inst & !0xfff) as i32,
+            rd:  Register::from((inst >> 7) & 0b11111),
+        }
+    }
+}
+
+// x0-x31, pc registers
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(usize)]
+enum Register {
+    Zero,
+    Ra,
+    Sp,
+    Gp,
+    Tp,
+    T0,
+    T1,
+    T2,
+    S0,
+    S1,
+    A0,
+    A1,
+    A2,
+    A3,
+    A4,
+    A5,
+    A6,
+    A7,
+    S2,
+    S3,
+    S4,
+    S5,
+    S6,
+    S7,
+    S8,
+    S9,
+    S10,
+    S11,
+    T3,
+    T4,
+    T5,
+    T6,
+    Pc
+}
+
+impl From<u32> for Register {
+    fn from(val: u32) -> Self {
+        assert!(val < 32); // Don't allow access to pc register
+        unsafe {
+            core::ptr::read_unaligned(&(val as usize) as *const usize as *const Register)
+        }
+    }
+}
+
+pub enum VmExit {
+    // Exit due to syscall
+    Syscall,
+    // Clean exit
+    Exit,
+    // Read/write caused overflow of address space
+    AddressOverflow,
+    // Read/write to invalid memory
+    InvalidAccess(VirtAddr, usize),
+    // Read/write to memory with invalid permissions
+    ReadFault(VirtAddr),
+    // Read of uninitialized memory
+    UninitRead(VirtAddr),
+    // Write to non-writable memory
+    WriteFault(VirtAddr),
+}
 
 // Emulated process/system state
 pub struct Emulator {
     pub memory: Mmu,
+    registers: [u64; 33],
 }
 
 impl Emulator {
@@ -12,6 +213,7 @@ impl Emulator {
     pub fn new(size: usize) -> Self {
         Self {
             memory: Mmu::new(size),
+            registers: [0; 33],
         }
     }
 
@@ -19,12 +221,14 @@ impl Emulator {
     pub fn fork(&self) -> Self {
         Self {
             memory: self.memory.fork(),
+            registers: self.registers,
         }
     }
 
     // Reset the emulator to the state of another emulator
     pub fn reset(&mut self, other: &Self) {
         self.memory = other.memory.fork();
+        self.registers = other.registers;
     }
 
     // Load a program into memory
@@ -58,11 +262,11 @@ impl Emulator {
             self.memory.set_perms(virt_addr, mem_size, Perm(PermBit::Write as u8))?;
 
             // Write from file to memory
-            self.memory.write(virt_addr, &file_contents[file_offset..file_offset.checked_add(file_size)?], Some(()))?;
+            self.memory.write_from(virt_addr, &file_contents[file_offset..file_offset.checked_add(file_size)?])?;
 
             // Write 0 padding if necessary
             if file_size < mem_size {
-                self.memory.write(VirtAddr(virt_addr.0.checked_add(file_size)?), &vec![0; mem_size - file_size], Some(()))?;
+                self.memory.write_from(VirtAddr(virt_addr.0.checked_add(file_size)?), &vec![0; mem_size - file_size])?;
             }
 
             // Set appropriate permissions
@@ -77,5 +281,194 @@ impl Emulator {
 
         // Return entry point
         Some(VirtAddr(file.ehdr.e_entry as usize))
+    }
+
+
+    pub fn reg(&self, reg: Register) -> u64 {
+        if reg == Register::Zero {
+            0
+        } else {
+            self.registers[reg as usize]
+        }
+    }
+
+    pub fn set_reg(&mut self, reg: Register, val: u64) {
+        println!("Setting register {:?} to {:#X}\n", reg, val);
+        if reg != Register::Zero {
+            self.registers[reg as usize] = val;
+        }
+    }
+
+    pub fn run(&mut self, entry_point: Option<VirtAddr>) -> Option<()> {
+        if entry_point.is_some() {
+            self.set_reg(Register::Pc, entry_point.unwrap().0 as u64);
+        }
+
+        'next_inst: loop {
+            // Fetch program counter
+            let pc = self.reg(Register::Pc);
+            let instr = self.memory.read::<u32>(VirtAddr(pc as usize))?;
+
+            let opcode = instr & 0b1111111;
+
+            // Notes:
+            // - Remember to sign extend properly
+            match opcode {
+                0b0110111 => {
+                    // LUI
+                    let utype: Utype = instr.into();
+                    let imm = utype.imm as i64 as u64;
+                    let rd = utype.rd;
+                    self.set_reg(rd, imm);
+                }
+                0b0010111 => {
+                    // AUIPC
+                    let utype: Utype = instr.into();
+                    let imm = utype.imm as i64 as u64;
+                    let rd = utype.rd;
+                    self.set_reg(rd, pc.wrapping_add(imm));
+                }
+                0b1101111 => {
+                    // JAL
+                    let jtype: Jtype = instr.into();
+                    let imm = jtype.imm as i64 as u64;
+                    let rd = jtype.rd;
+                    self.set_reg(rd, pc.wrapping_add(4));
+                    self.set_reg(Register::Pc, pc.wrapping_add(imm));
+                    continue 'next_inst;
+                }
+                0b1100111 => {
+                    // JALR
+                    let itype: Itype = instr.into();
+                    match itype.funct3 {
+                        0b000 => {
+                            let imm = itype.imm as i64 as u64;
+                            let rs1 = itype.rs1;
+                            let rd = itype.rd;
+                            let rs1_val = self.reg(rs1);
+                            let target= rs1_val.wrapping_add(imm);
+                            self.set_reg(rd, pc.wrapping_add(4));
+                            self.set_reg(Register::Pc, target);
+                            continue 'next_inst;
+                        }
+                        _ => unimplemented!("(JALR) Unhandle funct3: {:#03b}", itype.funct3),
+                    }
+                }
+                0b1100011 => {
+                    // Branch instructions
+                    let btype: Btype = instr.into();
+                    let imm = btype.imm as i64 as u64;
+                    let rs1 = btype.rs1;
+                    let rs2 = btype.rs2;
+                    let funct3 = btype.funct3;
+
+                    let rs1_val = self.reg(rs1);
+                    let rs2_val = self.reg(rs2);
+
+                    let take_branch = match funct3 {
+                        /* BEQ */ 0b000 => rs1_val == rs2_val,
+                        /* BNE */ 0b001 => rs1_val != rs2_val,
+                        /* BLT */ 0b100 => (rs1_val as i64) < (rs2_val as i64),
+                        /* BGE */ 0b101 => (rs1_val as i64) >= (rs2_val as i64),
+                        /* BLTU */ 0b110 => rs1_val < rs2_val,
+                        /* BGEU */ 0b111 => rs1_val >= rs2_val,
+                        _ => unimplemented!("(Branch) Unhandle funct3: {:#03b}", funct3),
+                    };
+
+                    if take_branch {
+                        self.set_reg(Register::Pc, pc.wrapping_add(imm));
+                        continue 'next_inst;
+                    }
+                }
+                0b0000011 => {
+                    // Load instructions
+                    let itype: Itype = instr.into();
+                    let imm = itype.imm as i64 as u64;
+                    let rs1 = itype.rs1;
+                    let rd = itype.rd;
+                    let funct3 = itype.funct3;
+
+                    let rs1_val = self.reg(rs1);
+                    let addr = rs1_val.wrapping_add(imm);
+
+                    let val = match funct3 {
+                        /* LB */ 0b000 => self.memory.read::<i8>(VirtAddr(addr as usize))? as u64,
+                        /* LH */ 0b001 => self.memory.read::<i16>(VirtAddr(addr as usize))? as u64,
+                        /* LW */ 0b010 => self.memory.read::<i32>(VirtAddr(addr as usize))? as u64,
+                        /* LD */ 0b011 => self.memory.read::<i64>(VirtAddr(addr as usize))? as u64,
+                        /* LBU */ 0b100 => self.memory.read::<u8>(VirtAddr(addr as usize))? as u64,
+                        /* LHU */ 0b101 => self.memory.read::<u16>(VirtAddr(addr as usize))? as u64,
+                        /* LWU */ 0b110 => self.memory.read::<u32>(VirtAddr(addr as usize))? as u64,
+                        _ => unimplemented!("(Load) Unhandle funct3: {:#03b}", funct3),
+                    };
+
+                    self.set_reg(rd, val);
+                }
+                0b0100011 => {
+                    // Store instructions
+                    let stype: Stype = instr.into();
+                    let imm = stype.imm as i64 as u64;
+                    let rs1 = stype.rs1;
+                    let rs2 = stype.rs2;
+                    let funct3 = stype.funct3;
+
+                    let rs1_val = self.reg(rs1);
+                    let rs2_val = self.reg(rs2);
+                    let addr = VirtAddr(rs1_val.wrapping_add(imm) as usize);
+
+                    match funct3 {
+                        /* SB */ 0b000 => self.memory.write(addr, rs2_val as u8),
+                        /* SH */ 0b001 => self.memory.write(addr, rs2_val as u16),
+                        /* SW */ 0b010 => self.memory.write(addr, rs2_val as u32),
+                        /* SD */ 0b011 => self.memory.write(addr, rs2_val as u64),
+                        _ => unimplemented!("(Store) Unhandle funct3: {:#03b}", funct3),
+                    };
+                }
+                0b0010011 => {
+                    // ALU instructions
+                    let itype: Itype = instr.into();
+                    let imm = itype.imm as i64 as u64;
+                    let rs1 = itype.rs1;
+                    let rd = itype.rd;
+                    let funct3 = itype.funct3;
+
+                    let rs1_val = self.reg(rs1);
+
+                    let val = match funct3 {
+                        /* ADDI */ 0b000 => rs1_val.wrapping_add(imm),
+                        /* SLTI */ 0b010 => ((rs1_val as i64) < (imm as i64)) as i64 as u64,
+                        /* SLTIU */ 0b011 => (rs1_val < imm) as u64,
+                        /* XORI */ 0b100 => rs1_val ^ imm,
+                        /* ORI */ 0b110 => rs1_val | imm,
+                        /* ANDI */ 0b111 => rs1_val & imm,
+                        /* L-SHIFT */ 0b001 => { 
+                            let mode = (imm >> 6) & 0b111111;
+                            let shift = imm & 0b111111;
+                            match mode {
+                                /* SLLI */ 0b000000 => rs1_val << shift,
+                                _ => unreachable!("(LSH) Unhandle mode: {:#06b}", mode),
+                            }
+                        },
+                        /* R-SHIFT */ 0b101 => {
+                            let mode = (imm >> 6) & 0b111111;
+                            let shift = imm & 0b111111;
+
+                            match mode {
+                                /* SRLI */ 0b000000 => rs1_val >> shift,
+                                /* SRAI */ 0b010000 => ((rs1_val as i64) >> shift) as u64,
+                                _ => unreachable!("(RSH) Unhandle mode: {:#06b}", mode),
+                            }
+                        }
+                        _ => unimplemented!("(ALU) Unhandle funct3: {:#03b}", funct3),
+                    };
+
+                    self.set_reg(rd, val);
+                }
+                _ => unimplemented!("Unhandle opcode: {:#09b}", opcode),
+            }
+
+            // Increment program counter
+            self.set_reg(Register::Pc, pc.wrapping_add(4));
+        }
     }
 }
