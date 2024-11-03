@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(transparent)]
-pub struct Perm(u8);
+pub struct Perm(pub u8);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
@@ -123,7 +123,7 @@ pub struct Mmu {
     pub dirty: DirtyState,
 
     // Base address of the next allocation
-    alloc_base: VirtAddr,
+    pub alloc_base: VirtAddr,
 
     // Active allocations
     allocations: HashMap<VirtAddr, usize>,
@@ -223,21 +223,25 @@ impl Mmu {
     }
 
     // Set permissions for a region of memory
-    pub fn set_perms(&mut self, addr: VirtAddr, size:usize, perm: Perm) -> Option<()> {
+    pub fn set_perms(&mut self, addr: VirtAddr, size: usize, perm: Perm) -> Option<()> {
         self.permissions.get_mut(addr.0..addr.0.checked_add(size)?)?.iter_mut().for_each(|p| *p = perm);
         Some(())
     }
 
     // Write from `buf` to `addr`
-    pub fn write(&mut self, addr: VirtAddr, buf: &[u8]) -> Option<()> {
+    // Admin is a special permission that allows writing to non-living allocations
+    pub fn write(&mut self, addr: VirtAddr, buf: &[u8], admin: Option<()>) -> Option<()> {
         // Check if write is within bounds of allocation
-        let size = self.get_alloc_size(addr)?;
-        if buf.len() > size {
-            // println!("Attempt to write outside of allocation");
-            return None;
+        if admin.is_none() {
+            let size = self.get_alloc_size(addr).expect("Allocation is not live");
+            if buf.len() > size {
+                println!("Attempt to write outside of allocation");
+                return None;
+            }
         }
 
-        let mut perms = self.permissions.get_mut(addr.0..addr.0.checked_add(buf.len())?)?;
+        let perms = self.permissions.get_mut(addr.0..addr.0.checked_add(buf.len()).expect("Address overflow"))
+            .expect("Failed to get permissions");
 
         // Check if all bytes are writable
         // Check if any bytes are ReadAfterWrite
@@ -246,22 +250,23 @@ impl Mmu {
             is_raw |= (p.0 & PermBit::ReadAfterWrite as u8) != 0;
             (p.0 & PermBit::Write as u8) != 0
         }) {
-            // println!("Attempt to write to non-writable memory");
+            println!("Attempt to write to non-writable memory");
             return None;
         }
 
         // Perform write
-        self.memory.get_mut(addr.0..addr.0.checked_add(buf.len())?)?
+        self.memory.get_mut(addr.0..addr.0.checked_add(buf.len()).expect("Address overflow"))
+            .expect("Failed to get memory")
             .copy_from_slice(buf);
 
         // Mark dirty blocks
-        self.dirty.mark(addr, Some(buf.len()))?;
+        self.dirty.mark(addr, Some(buf.len())).expect("Failed to mark dirty");
 
         // If any byte is ReadAfterWrite, mark the byte as Read
         if is_raw {
             perms.iter_mut().for_each(|p| {
                 if (p.0 & PermBit::ReadAfterWrite as u8) != 0 {
-                    p.0 |= PermBit::Read as u8;
+                    p.0 |= (PermBit::Read as u8) & !(PermBit::ReadAfterWrite as u8);
                 }
             });
         }
