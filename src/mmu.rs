@@ -1,5 +1,5 @@
-// Permission bits
 
+use nightcrawler::Primitive;
 use std::collections::HashMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -230,28 +230,21 @@ impl Mmu {
 
     // Write from `buf` to `addr`
     // Admin is a special permission that allows writing to non-living allocations
-    pub fn write(&mut self, addr: VirtAddr, buf: &[u8], admin: Option<()>) -> Option<()> {
-        // Check if write is within bounds of allocation
-        if admin.is_none() {
-            let size = self.get_alloc_size(addr).expect("Allocation is not live");
-            if buf.len() > size {
-                println!("Attempt to write outside of allocation");
-                return None;
-            }
-        }
-
+    pub fn write_from(&mut self, addr: VirtAddr, buf: &[u8]) -> Option<()> {
+        // Check permissions for all bytes
         let perms = self.permissions.get_mut(addr.0..addr.0.checked_add(buf.len()).expect("Address overflow"))
             .expect("Failed to get permissions");
 
         // Check if all bytes are writable
         // Check if any bytes are ReadAfterWrite
         let mut is_raw = false;
-        if !perms.iter().all(|p| {
+        for (idx, &p) in perms.iter().enumerate() {
+            if (p.0 & PermBit::Write as u8) == 0 {
+                println!("Attempt to write to non-writable memory at offset {}", idx);
+                return None;
+            }
+
             is_raw |= (p.0 & PermBit::ReadAfterWrite as u8) != 0;
-            (p.0 & PermBit::Write as u8) != 0
-        }) {
-            println!("Attempt to write to non-writable memory");
-            return None;
         }
 
         // Perform write
@@ -274,12 +267,21 @@ impl Mmu {
 
         Some(())
     }
+    
+    // Write sizeof T bytes from `val` to `addr`
+    pub fn write<T: Primitive>(&mut self, addr: VirtAddr, val: T) -> Option<()> {
+        let tmp = unsafe { 
+            core::slice::from_raw_parts(&val as *const T as *const u8, core::mem::size_of::<T>())
+        };
 
-    // Read from `addr` to `buf`
-    pub fn read(&self, addr: VirtAddr, buf: &mut [u8]) -> Option<()> {
+        self.write_from(addr, tmp)
+    }
+
+    // Read from `addr` into `buf` with expected permissions
+    pub fn read_with_perms(&self, addr: VirtAddr, buf: &mut [u8], expected_perm: Perm) -> Option<()> {
         // Check if any bytes aren't readable
         let perms = self.permissions.get(addr.0..addr.0.checked_add(buf.len())?)?;
-        if perms.iter().any(|p| (p.0 & PermBit::Read as u8) == 0) {
+        if expected_perm.0 != (PermBit::Unknown as u8) && perms.iter().any(|p| (p.0 & expected_perm.0) == 0) {
             return None;
         }
 
@@ -287,4 +289,20 @@ impl Mmu {
         Some(())
     }
 
+    // Read from `addr` into `buf`
+    pub fn read_into(&self, addr: VirtAddr, buf: &mut [u8]) -> Option<()> {
+        self.read_with_perms(addr, buf, Perm(PermBit::Read as u8))
+    }
+
+    // Read of sizeof T bytes from `addr` with expected permissions
+    pub fn read_perms<T: Primitive>(&self, addr: VirtAddr, expected_perms: Perm) -> Option<T> {
+        let mut tmp = [0u8; 16]; // Largest supported primitive is u128
+        self.read_with_perms(addr, &mut tmp[..std::mem::size_of::<T>()], expected_perms)?;
+        Some(unsafe { core::ptr::read_unaligned(tmp.as_ptr() as *const T) })
+    }
+
+    // Read of sizeof T bytes from `addr`
+    pub fn read<T: Primitive>(&self, addr: VirtAddr) -> Option<T> {
+        self.read_perms(addr, Perm(PermBit::Read as u8))
+    }
 }
