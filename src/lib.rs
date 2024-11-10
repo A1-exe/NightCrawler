@@ -20,20 +20,20 @@ impl Rng {
 }
 
 // Generic support for safe primitive types
-pub unsafe trait Primitive: Default + Clone + Copy {}
+pub unsafe trait Prim: Default + Clone + Copy {}
 
-unsafe impl Primitive for u8    {}
-unsafe impl Primitive for u16   {}
-unsafe impl Primitive for u32   {}
-unsafe impl Primitive for u64   {}
-unsafe impl Primitive for u128  {}
-unsafe impl Primitive for usize {}
-unsafe impl Primitive for i8    {}
-unsafe impl Primitive for i16   {}
-unsafe impl Primitive for i32   {}
-unsafe impl Primitive for i64   {}
-unsafe impl Primitive for i128  {}
-unsafe impl Primitive for isize {}
+unsafe impl Prim for u8    {}
+unsafe impl Prim for u16   {}
+unsafe impl Prim for u32   {}
+unsafe impl Prim for u64   {}
+unsafe impl Prim for u128  {}
+unsafe impl Prim for usize {}
+unsafe impl Prim for i8    {}
+unsafe impl Prim for i16   {}
+unsafe impl Prim for i32   {}
+unsafe impl Prim for i64   {}
+unsafe impl Prim for i128  {}
+unsafe impl Prim for isize {}
 
 
 #[cfg(test)]

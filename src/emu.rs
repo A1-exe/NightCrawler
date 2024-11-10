@@ -138,9 +138,10 @@ impl From<u32> for Utype {
 }
 
 // x0-x31, pc registers
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(usize)]
-enum Register {
+pub enum Register {
     Zero,
     Ra,
     Sp,
@@ -201,6 +202,32 @@ pub enum VmExit {
     // Write to non-writable memory
     WriteFault(VirtAddr),
 }
+
+// Utility macros
+#[macro_export]
+macro_rules! push { // Push value of generic size onto emu stack
+    ($emu:ident, $expr:expr) => {
+        {
+            let sp = $emu.reg(Register::Sp) - (core::mem::size_of_val(&$expr) as u64);
+            println!("Pushing 0x{:X} to 0x{:X}", $expr, sp);
+            $emu.memory.write(VirtAddr(sp as usize), $expr).expect("push failed");
+            $emu.set_reg(Register::Sp, sp);
+        }
+    }
+}
+
+#[macro_export]
+macro_rules! pop {
+    ($generic:ty, $emu:ident) => {
+        {
+            let sp = emu.reg(Register::Sp);
+            let val = emu.memory.read::<$generic>(VirtAddr(sp as usize)).expect("pop failed");
+            emu.set_reg(Register::Sp, sp + (core::mem::size_of::<$generic>() as u64));
+            val as $generic
+        }
+    }
+}
+
 
 // Emulated process/system state
 pub struct Emulator {
@@ -293,7 +320,7 @@ impl Emulator {
     }
 
     pub fn set_reg(&mut self, reg: Register, val: u64) {
-        println!("Setting register {:?} to {:#X}\n", reg, val);
+        // println!("Setting register {:?} to {:#X}", reg, val);
         if reg != Register::Zero {
             self.registers[reg as usize] = val;
         }
@@ -307,6 +334,8 @@ impl Emulator {
         'next_inst: loop {
             // Fetch program counter
             let pc = self.reg(Register::Pc);
+            println!("PC: {:#X}", pc);
+
             let instr = self.memory.read::<u32>(VirtAddr(pc as usize))?;
 
             let opcode = instr & 0b1111111;
@@ -346,7 +375,8 @@ impl Emulator {
                             let rs1 = itype.rs1;
                             let rd = itype.rd;
                             let rs1_val = self.reg(rs1);
-                            let target= rs1_val.wrapping_add(imm);
+                            let target = rs1_val.wrapping_add(imm);
+                            println!("JALR: target = {:#X}", target);
                             self.set_reg(rd, pc.wrapping_add(4));
                             self.set_reg(Register::Pc, target);
                             continue 'next_inst;
@@ -463,6 +493,133 @@ impl Emulator {
                     };
 
                     self.set_reg(rd, val);
+                }
+                0b0110011 => {
+                    // R-type instructions
+                    let rtype: Rtype = instr.into();
+                    let rs1 = rtype.rs1;
+                    let rs2 = rtype.rs2;
+                    let rd = rtype.rd;
+                    let funct3 = rtype.funct3;
+                    let funct7 = rtype.funct7;
+
+                    let rs1_val = self.reg(rs1);
+                    let rs2_val = self.reg(rs2);
+
+                    let val = match funct3 {
+                        0b000 => {
+                            match funct7 {
+                                /* ADD */ 0b0000000 => rs1_val.wrapping_add(rs2_val),
+                                /* SUB */ 0b0100000 => rs1_val.wrapping_sub(rs2_val),
+                                _ => unreachable!("(ADD/SUB) Unhandle mode: {:#07b}", funct7),
+                            }
+                        }
+                        /* SLL */ 0b001 => rs1_val << (rs2_val & 0b111111),
+                        /* SLT */ 0b010 => ((rs1_val as i64) < (rs2_val as i64)) as i64 as u64,
+                        /* SLTU */ 0b011 => (rs1_val < rs2_val) as u64,
+                        /* XOR */ 0b100 => rs1_val ^ rs2_val,
+                        0b101 => {
+                            match funct7 {
+                                /* SRL */ 0b0000000 => rs1_val >> (rs2_val & 0b111111),
+                                /* SRA */ 0b0100000 => ((rs1_val as i64) >> (rs2_val & 0b111111)) as u64,
+                                _ => unreachable!("(SRL/SRA) Unhandle mode: {:#07b}", funct7),
+                            }
+                        }
+                        /* OR */ 0b110 => rs1_val | rs2_val,
+                        /* AND */ 0b111 => rs1_val & rs2_val,
+                        _ => unimplemented!("(R-Type) Unhandle funct3: {:#03b}", funct3),
+                    };
+
+                    self.set_reg(rd, val);
+                }
+                0b0011011 => {
+                    // I-type instructions
+                    let itype: Itype = instr.into();
+                    let imm = itype.imm as i64 as u64;
+                    let rs1 = itype.rs1;
+                    let rd = itype.rd;
+                    let funct3 = itype.funct3;
+
+                    let rs1_val = self.reg(rs1);
+
+                    let val = match funct3 {
+                        /* ADDIW */ 0b000 => rs1_val.wrapping_add(imm) as i32 as i64 as u64,
+                        /* SLLIW */ 0b001 => rs1_val << (imm & 0b11111) as i32 as i64 as u64,
+                        0b101 => {
+                            let mode = (imm >> 5) & 0b111111;
+                            let shift = imm & 0b11111;
+                            match mode {
+                                /* SRLIW */ 0b000000 => rs1_val >> shift as i32 as i64 as u64,
+                                /* SRAIW */ 0b010000 => ((rs1_val as i32) >> shift) as i64 as u64,
+                                _ => unreachable!("(SRLIW/SRAIW) Unhandle mode: {:#06b}", mode),
+                            }
+                        }
+                        _ => unimplemented!("(I-Type) Unhandle funct3: {:#03b}", funct3),
+                    };
+
+                    self.set_reg(rd, val);
+                }
+                0b0111011 => {
+                    // R4-type instructions
+                    let rtype: Rtype = instr.into();
+                    let rs1 = rtype.rs1;
+                    let rs2 = rtype.rs2;
+                    let rd = rtype.rd;
+                    let funct3 = rtype.funct3;
+                    let funct7 = rtype.funct7;
+
+                    let rs1_val = self.reg(rs1);
+                    let rs2_val = self.reg(rs2);
+
+                    let val = match funct3 {
+                        0b000 => {
+                            let mode = (funct7 >> 5) & 0b1111111;
+                            match mode {
+                                /* ADDW */ 0b0000000 => rs1_val.wrapping_add(rs2_val) as i32 as i64 as u64,
+                                /* SUBW */ 0b0100000 => rs1_val.wrapping_sub(rs2_val) as i32 as i64 as u64,
+                                _ => unreachable!("(ADDW/SUBW) Unhandle mode: {:#07b}", mode),
+                            }
+                        }
+                        /* SLLW */ 0b001 => rs1_val << (rs2_val & 0b11111) as i32 as i64 as u64,
+                        /* SRLW */ 0b101 => {
+                            let mode = (funct7 >> 5) & 0b1111111;
+                            match mode {
+                                /* SRLW */ 0b0000000 => rs1_val >> (rs2_val & 0b11111) as i32 as i64 as u64,
+                                /* SRAW */ 0b0100000 => ((rs1_val as i32) >> (rs2_val & 0b11111)) as i64 as u64,
+                                _ => unreachable!("(SRLW/SRAW) Unhandle mode: {:#07b}", mode),
+                            }
+                        }
+                        _ => unimplemented!("(R4-Type) Unhandle funct3: {:#03b}", funct3),
+                    };
+
+                    self.set_reg(rd, val);
+                }
+                0b0001111 => {
+                    // FENCE
+                    let pred = (instr >> 24) & 0b1111;
+                    let succ = (instr >> 20) & 0b1111;
+                    if pred == 0b0011 && succ == 0b0011 {
+                        // FENCE.TSO
+                        unimplemented!("(FENCE) FENCE.TSO");
+                    }
+                    if pred != 0 || succ != 0 {
+                        unimplemented!("(FENCE) Unhandle pred/succ: {:#04b} {:#04b}", pred, succ);
+                    }
+                }
+                0b1110011 => {
+                    // ECALL/EBREAK
+                    let funct3 = (instr >> 12) & 0b111;
+                    match funct3 {
+                        0b000 => {
+                            // ECALL
+                            panic!("ECALL not implemented");
+                        },
+                        0b001 => {
+                            // EBREAK
+                            panic!("EBREAK not implemented");
+                        },
+                        _ => unimplemented!("(ECALL/EBREAK) Unhandle funct3: {:#03b}", funct3),
+                    }
                 }
                 _ => unimplemented!("Unhandle opcode: {:#09b}", opcode),
             }

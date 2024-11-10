@@ -1,5 +1,5 @@
 
-use nightcrawler::Primitive;
+use nightcrawler::Prim;
 use std::collections::HashMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -219,6 +219,9 @@ impl Mmu {
         // Track the allocation
         self.allocations.insert(base, size);
 
+        println!("Allocated {:X} bytes at {:X}", size, base.0);
+        println!("Allocations: {:X?}", self.allocations);
+
         Some(base)
     }
 
@@ -238,9 +241,9 @@ impl Mmu {
         // Check if all bytes are writable
         // Check if any bytes are ReadAfterWrite
         let mut is_raw = false;
-        for (idx, &p) in perms.iter().enumerate() {
+        for (offset, &p) in perms.iter().enumerate() {
             if (p.0 & PermBit::Write as u8) == 0 {
-                println!("Attempt to write to non-writable memory at offset {}", idx);
+                println!("Attempt to write to non-writable memory at offset 0x{:X} of addr 0x{:X} (@0x{:X}", offset, addr.0, addr.0 + offset);
                 return None;
             }
 
@@ -269,7 +272,7 @@ impl Mmu {
     }
     
     // Write sizeof T bytes from `val` to `addr`
-    pub fn write<T: Primitive>(&mut self, addr: VirtAddr, val: T) -> Option<()> {
+    pub fn write<T: Prim>(&mut self, addr: VirtAddr, val: T) -> Option<()> {
         let tmp = unsafe { 
             core::slice::from_raw_parts(&val as *const T as *const u8, core::mem::size_of::<T>())
         };
@@ -295,14 +298,14 @@ impl Mmu {
     }
 
     // Read of sizeof T bytes from `addr` with expected permissions
-    pub fn read_perms<T: Primitive>(&self, addr: VirtAddr, expected_perms: Perm) -> Option<T> {
+    pub fn read_perms<T: Prim>(&self, addr: VirtAddr, expected_perms: Perm) -> Option<T> {
         let mut tmp = [0u8; 16]; // Largest supported primitive is u128
         self.read_with_perms(addr, &mut tmp[..std::mem::size_of::<T>()], expected_perms)?;
         Some(unsafe { core::ptr::read_unaligned(tmp.as_ptr() as *const T) })
     }
 
     // Read of sizeof T bytes from `addr`
-    pub fn read<T: Primitive>(&self, addr: VirtAddr) -> Option<T> {
+    pub fn read<T: Prim>(&self, addr: VirtAddr) -> Option<T> {
         self.read_perms(addr, Perm(PermBit::Read as u8))
     }
 }
