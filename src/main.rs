@@ -4,6 +4,7 @@ pub mod mmu;
 use emu::{Emulator, Register};
 use mmu::VirtAddr;
 
+#[allow(unused)]
 use std::time::Instant;
 
 #[macro_export]

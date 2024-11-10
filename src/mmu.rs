@@ -87,10 +87,10 @@ impl DirtyState {
     }
 
     // Mark an address as dirty
-    pub fn mark(&mut self, addr: VirtAddr, len: Option<usize>) -> Option<()>{
+    pub fn mark(&mut self, addr: VirtAddr, len: Option<usize>) -> Result<(), MmuError> {
         let len: usize = len.unwrap_or(1);
         let block_start = addr.0 / DIRTY_BLOCK_SIZE;
-        let block_end = addr.0.checked_add(len)? / DIRTY_BLOCK_SIZE;
+        let block_end = addr.0.checked_add(len).ok_or(MmuError::AddressOverflow(addr, len))? / DIRTY_BLOCK_SIZE;
 
         for block in block_start..=block_end {
             let idx = block / 64;
@@ -105,8 +105,22 @@ impl DirtyState {
             self.bitmap[idx] |= 1 << bit;
         }
 
-        Some(())
+        Ok(())
     }
+}
+
+#[derive(Debug)]
+pub enum MmuError {
+    // Return error that address is invalid
+    InvalidAddr(VirtAddr),
+    // Return error that permissions are invalid
+    InvalidPerms(Perm, VirtAddr, usize),
+    // Return error that address overflowed
+    AddressOverflow(VirtAddr, usize),
+    // Return error that MMU is out of memory
+    OutOfMemory(String),
+    // Emulator developer error
+    MetaError(String),
 }
 
 // An isolated memory management unit
@@ -191,7 +205,7 @@ impl Mmu {
     }
     
     // Allocate a region of memory as uninitialized permissions
-    pub fn alloc(&mut self, size: usize) -> Option<VirtAddr> {
+    pub fn alloc(&mut self, size: usize) -> Result<VirtAddr, MmuError> {
         // Size is 0x10 byte aligned (Add padding)
         let aligned_size = (size + 0xF) & !0xF;
         
@@ -200,21 +214,21 @@ impl Mmu {
         
         // No more memory
         if base.0 >= self.memory.len() {
-            return None;
+            return Err(MmuError::OutOfMemory("No more memory".to_string()));
         }
 
         // Update allocation base
-        self.alloc_base = VirtAddr(self.alloc_base.0.checked_add(aligned_size)?);
+        self.alloc_base = VirtAddr(self.alloc_base.0.checked_add(aligned_size).ok_or(MmuError::AddressOverflow(self.alloc_base, aligned_size))?);
 
         // Check if ran out of memory
         if self.alloc_base.0 > self.memory.len() {
-            return None;
+            return Err(MmuError::OutOfMemory("Ran out of memory".to_string()));
         }
 
         // Mark the memory as un-initialized and writable
         // Notice the use of size instead of aligned_size
         // This is because compiler optimizations use the padding sometimes
-        self.set_perms(base, size, Perm(PermBit::ReadAfterWrite as u8 | PermBit::Write as u8));
+        self.set_perms(base, size, Perm(PermBit::ReadAfterWrite as u8 | PermBit::Write as u8))?;
 
         // Track the allocation
         self.allocations.insert(base, size);
@@ -222,21 +236,24 @@ impl Mmu {
         println!("Allocated {:X} bytes at {:X}", size, base.0);
         println!("Allocations: {:X?}", self.allocations);
 
-        Some(base)
+        Ok(base)
     }
 
     // Set permissions for a region of memory
-    pub fn set_perms(&mut self, addr: VirtAddr, size: usize, perm: Perm) -> Option<()> {
-        self.permissions.get_mut(addr.0..addr.0.checked_add(size)?)?.iter_mut().for_each(|p| *p = perm);
-        Some(())
+    pub fn set_perms(&mut self, addr: VirtAddr, size: usize, perm: Perm) -> Result<(), MmuError> {
+        self.permissions.get_mut(addr.0..addr.0.checked_add(size).ok_or(MmuError::AddressOverflow(addr, size))?)
+            .ok_or(MmuError::MetaError("Could not get_mut permissions".to_string()))?
+            .iter_mut()
+            .for_each(|p| *p = perm);
+        Ok(())
     }
 
     // Write from `buf` to `addr`
     // Admin is a special permission that allows writing to non-living allocations
-    pub fn write_from(&mut self, addr: VirtAddr, buf: &[u8]) -> Option<()> {
+    pub fn write_from(&mut self, addr: VirtAddr, buf: &[u8]) -> Result<(), MmuError> {
         // Check permissions for all bytes
-        let perms = self.permissions.get_mut(addr.0..addr.0.checked_add(buf.len()).expect("Address overflow"))
-            .expect("Failed to get permissions");
+        let perms = self.permissions.get_mut(addr.0..addr.0.checked_add(buf.len()).ok_or(MmuError::AddressOverflow(addr, buf.len()))?)
+            .ok_or(MmuError::MetaError("Could not get_mut permissions".to_string()))?;
 
         // Check if all bytes are writable
         // Check if any bytes are ReadAfterWrite
@@ -244,35 +261,35 @@ impl Mmu {
         for (offset, &p) in perms.iter().enumerate() {
             if (p.0 & PermBit::Write as u8) == 0 {
                 println!("Attempt to write to non-writable memory at offset 0x{:X} of addr 0x{:X} (@0x{:X}", offset, addr.0, addr.0 + offset);
-                return None;
+                return Err(MmuError::InvalidPerms(Perm(PermBit::Write as u8), addr, buf.len()));
             }
 
             is_raw |= (p.0 & PermBit::ReadAfterWrite as u8) != 0;
         }
 
         // Perform write
-        self.memory.get_mut(addr.0..addr.0.checked_add(buf.len()).expect("Address overflow"))
-            .expect("Failed to get memory")
+        self.memory.get_mut(addr.0..addr.0.checked_add(buf.len()).ok_or(MmuError::AddressOverflow(addr, buf.len()))?)
+            .ok_or(MmuError::InvalidAddr(addr))?
             .copy_from_slice(buf);
 
         // Mark dirty blocks
-        self.dirty.mark(addr, Some(buf.len())).expect("Failed to mark dirty");
+        self.dirty.mark(addr, Some(buf.len()))?;
 
         // If any byte is ReadAfterWrite, mark the byte as Read
         if is_raw {
             perms.iter_mut().for_each(|p| {
                 if (p.0 & PermBit::ReadAfterWrite as u8) != 0 {
-                    p.0 |= (PermBit::Read as u8) & !(PermBit::ReadAfterWrite as u8);
+                    p.0 = (p.0 | (PermBit::Read as u8)) & !(PermBit::ReadAfterWrite as u8);
                 }
             });
         }
         
 
-        Some(())
+        Ok(())
     }
     
     // Write sizeof T bytes from `val` to `addr`
-    pub fn write<T: Prim>(&mut self, addr: VirtAddr, val: T) -> Option<()> {
+    pub fn write<T: Prim>(&mut self, addr: VirtAddr, val: T) -> Result<(), MmuError> {
         let tmp = unsafe { 
             core::slice::from_raw_parts(&val as *const T as *const u8, core::mem::size_of::<T>())
         };
@@ -281,31 +298,32 @@ impl Mmu {
     }
 
     // Read from `addr` into `buf` with expected permissions
-    pub fn read_with_perms(&self, addr: VirtAddr, buf: &mut [u8], expected_perm: Perm) -> Option<()> {
+    pub fn read_with_perms(&self, addr: VirtAddr, buf: &mut [u8], expected_perm: Perm) -> Result<(), MmuError> {
         // Check if any bytes aren't readable
-        let perms = self.permissions.get(addr.0..addr.0.checked_add(buf.len())?)?;
+        let perms = self.permissions.get(addr.0..addr.0.checked_add(buf.len()).ok_or(MmuError::AddressOverflow(addr, buf.len()))?).unwrap();
         if expected_perm.0 != (PermBit::Unknown as u8) && perms.iter().any(|p| (p.0 & expected_perm.0) == 0) {
-            return None;
+            return Err(MmuError::InvalidPerms(Perm(PermBit::Read as u8), addr, buf.len()));
         }
 
-        buf.copy_from_slice(&self.memory.get(addr.0..addr.0.checked_add(buf.len())?)?);
-        Some(())
+        buf.copy_from_slice(&self.memory.get(addr.0..addr.0.checked_add(buf.len()).ok_or(MmuError::AddressOverflow(addr, buf.len()))?)
+            .ok_or(MmuError::InvalidAddr(addr))?);
+        Ok(())
     }
 
     // Read from `addr` into `buf`
-    pub fn read_into(&self, addr: VirtAddr, buf: &mut [u8]) -> Option<()> {
+    pub fn read_into(&self, addr: VirtAddr, buf: &mut [u8]) -> Result<(), MmuError> {
         self.read_with_perms(addr, buf, Perm(PermBit::Read as u8))
     }
 
     // Read of sizeof T bytes from `addr` with expected permissions
-    pub fn read_perms<T: Prim>(&self, addr: VirtAddr, expected_perms: Perm) -> Option<T> {
+    pub fn read_perms<T: Prim>(&self, addr: VirtAddr, expected_perms: Perm) -> Result<T, MmuError> {
         let mut tmp = [0u8; 16]; // Largest supported primitive is u128
         self.read_with_perms(addr, &mut tmp[..std::mem::size_of::<T>()], expected_perms)?;
-        Some(unsafe { core::ptr::read_unaligned(tmp.as_ptr() as *const T) })
+        Ok(unsafe { core::ptr::read_unaligned(tmp.as_ptr() as *const T) })
     }
 
     // Read of sizeof T bytes from `addr`
-    pub fn read<T: Prim>(&self, addr: VirtAddr) -> Option<T> {
+    pub fn read<T: Prim>(&self, addr: VirtAddr) -> Result<T, MmuError> {
         self.read_perms(addr, Perm(PermBit::Read as u8))
     }
 }

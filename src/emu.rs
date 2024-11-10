@@ -1,5 +1,7 @@
 
-use crate::mmu::{Mmu, VirtAddr, Perm, PermBit};
+use core::fmt;
+
+use crate::mmu::{Mmu, VirtAddr, Perm, PermBit, MmuError};
 
 // An R-type instruction
 #[derive(Debug)]
@@ -186,23 +188,6 @@ impl From<u32> for Register {
     }
 }
 
-pub enum VmExit {
-    // Exit due to syscall
-    Syscall,
-    // Clean exit
-    Exit,
-    // Read/write caused overflow of address space
-    AddressOverflow,
-    // Read/write to invalid memory
-    InvalidAccess(VirtAddr, usize),
-    // Read/write to memory with invalid permissions
-    ReadFault(VirtAddr),
-    // Read of uninitialized memory
-    UninitRead(VirtAddr),
-    // Write to non-writable memory
-    WriteFault(VirtAddr),
-}
-
 // Utility macros
 #[macro_export]
 macro_rules! push { // Push value of generic size onto emu stack
@@ -216,7 +201,7 @@ macro_rules! push { // Push value of generic size onto emu stack
     }
 }
 
-#[macro_export]
+#[allow(unused)]
 macro_rules! pop {
     ($generic:ty, $emu:ident) => {
         {
@@ -228,11 +213,96 @@ macro_rules! pop {
     }
 }
 
+#[derive(Debug)]
+pub enum EmuExit {
+    // Error loading program
+    LoadError(String),
+    // Exit due to syscall
+    Syscall,
+    // Clean exit
+    Exit,
+    // Read/write caused overflow of address space
+    AddressOverflow(VirtAddr, usize),
+    // Read/write to invalid memory
+    InvalidAccess(VirtAddr, usize),
+    // Read/write to memory with invalid permissions
+    ReadFault(VirtAddr),
+    // Read of uninitialized memory
+    UninitRead(VirtAddr),
+    // Write to non-writable memory
+    WriteFault(VirtAddr),
+}
+
+impl From<MmuError> for EmuExit {
+    fn from(err: MmuError) -> Self {
+        match err {
+            MmuError::InvalidAddr(addr) => EmuExit::InvalidAccess(addr, 0),
+            MmuError::InvalidPerms(Perm(perm), addr, size) => {
+                let read = PermBit::Read as u8;
+                let write = PermBit::Write as u8;
+                let raw = PermBit::ReadAfterWrite as u8;
+
+                if perm & raw != 0 {
+                    EmuExit::UninitRead(addr)
+                } else if perm & read == 0 {
+                    EmuExit::ReadFault(addr)
+                } else if perm & write == 0 {
+                    EmuExit::WriteFault(addr)
+                } else {
+                    panic!("InvalidPerms: {:#X} {:#X} {:#X}", perm, addr.0, size)
+                }
+            }
+            MmuError::AddressOverflow(addr, size) => EmuExit::AddressOverflow(addr, size),
+            MmuError::OutOfMemory(e) => panic!("OutOfMemory: {:?}", e),
+            MmuError::MetaError(e) => panic!("MetaError: {:?}", e),
+        }
+    }
+}
 
 // Emulated process/system state
 pub struct Emulator {
     pub memory: Mmu,
     registers: [u64; 33],
+}
+
+impl fmt::Debug for Emulator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Emulator")
+            .field("zero", &self.reg(Register::Zero))
+            .field("ra", &self.reg(Register::Ra))
+            .field("sp", &self.reg(Register::Sp))
+            .field("gp", &self.reg(Register::Gp))
+            .field("tp", &self.reg(Register::Tp))
+            .field("t0", &self.reg(Register::T0))
+            .field("t1", &self.reg(Register::T1))
+            .field("t2", &self.reg(Register::T2))
+            .field("s0", &self.reg(Register::S0))
+            .field("s1", &self.reg(Register::S1))
+            .field("a0", &self.reg(Register::A0))
+            .field("a1", &self.reg(Register::A1))
+            .field("a2", &self.reg(Register::A2))
+            .field("a3", &self.reg(Register::A3))
+            .field("a4", &self.reg(Register::A4))
+            .field("a5", &self.reg(Register::A5))
+            .field("a6", &self.reg(Register::A6))
+            .field("a7", &self.reg(Register::A7))
+            .field("s2", &self.reg(Register::S2))
+            .field("s3", &self.reg(Register::S3))
+            .field("s4", &self.reg(Register::S4))
+            .field("s5", &self.reg(Register::S5))
+            .field("s6", &self.reg(Register::S6))
+            .field("s7", &self.reg(Register::S7))
+            .field("s8", &self.reg(Register::S8))
+            .field("s9", &self.reg(Register::S9))
+            .field("s10", &self.reg(Register::S10))
+            .field("s11", &self.reg(Register::S11))
+            .field("t3", &self.reg(Register::T3))
+            .field("t4", &self.reg(Register::T4))
+            .field("t5", &self.reg(Register::T5))
+            .field("t6", &self.reg(Register::T6))
+            .field("pc", &self.reg(Register::Pc))
+            .finish()
+    }
 }
 
 impl Emulator {
@@ -259,13 +329,15 @@ impl Emulator {
     }
 
     // Load a program into memory
-    pub fn load(&mut self, filename: &str) -> Option<VirtAddr> {
+    pub fn load(&mut self, filename: &str) -> Result<VirtAddr, EmuExit> {
         // Parse ELF file for LOAD sections
-        let file_contents = std::fs::read(filename).ok()?;
+        let file_contents = std::fs::read(filename).ok()
+            .ok_or(EmuExit::LoadError("Failed to read file from disk.".to_string()))?;
 
         use elf::endian::AnyEndian;
         use elf::ElfBytes;
-        let file = ElfBytes::<AnyEndian>::minimal_parse(&file_contents.as_slice()).unwrap();
+        let file = ElfBytes::<AnyEndian>::minimal_parse(&file_contents.as_slice()).ok()
+            .ok_or(EmuExit::LoadError("Failed to parse ELF file.".to_string()))?;
 
         for header in file.segments().expect("Failed to read segments") {
             // Only load LOAD segments
@@ -286,28 +358,34 @@ impl Emulator {
             // ** No need to mark as a live allocation since it'll restored when memory is cloned
             // ** Bounds checking on these allocations is unnecessary since off-by-one in these areas wouldn't be exploitable
             // ** Arbitrarily controlled read or writes relative to these areas would be detected by perms checks anyways
-            self.memory.set_perms(virt_addr, mem_size, Perm(PermBit::Write as u8))?;
+            self.memory.set_perms(virt_addr, mem_size, Perm(PermBit::Write as u8)).ok()
+                .ok_or(EmuExit::LoadError("Failed to set permissions on memory.".to_string()))?;
 
             // Write from file to memory
-            self.memory.write_from(virt_addr, &file_contents[file_offset..file_offset.checked_add(file_size)?])?;
+            self.memory.write_from(virt_addr, &file_contents[file_offset..file_offset.checked_add(file_size).ok_or(EmuExit::LoadError("File offsets caused addr overflow".to_string()))?]).ok()
+                .ok_or(EmuExit::LoadError("Failed to write from file to memory".to_string()))?;
 
             // Write 0 padding if necessary
             if file_size < mem_size {
-                self.memory.write_from(VirtAddr(virt_addr.0.checked_add(file_size)?), &vec![0; mem_size - file_size])?;
+                self.memory.write_from(
+                    VirtAddr(virt_addr.0.checked_add(file_size).ok_or(EmuExit::LoadError("File offsets caused addr overflow".to_string()))?), 
+                    &vec![0; mem_size - file_size]).ok()
+                .ok_or(EmuExit::LoadError("Failed to write padding to memory".to_string()))?;
             }
 
             // Set appropriate permissions
-            self.memory.set_perms(virt_addr, mem_size, Perm(perms))?;
+            self.memory.set_perms(virt_addr, mem_size, Perm(perms))
+                .ok().ok_or(EmuExit::LoadError("Failed to set permissions on memory.".to_string()))?;
 
             // Move allocator beyond loaded sections
             self.memory.alloc_base = VirtAddr(std::cmp::max(
                 self.memory.alloc_base.0, 
-                virt_addr.0.checked_add(mem_size + 0xFFF)? & !0xFFF)
+                virt_addr.0.checked_add(mem_size + 0xFFF).ok_or(EmuExit::LoadError("File offsets caused addr overflow".to_string()))? & !0xFFF)
             );
         }
 
         // Return entry point
-        Some(VirtAddr(file.ehdr.e_entry as usize))
+        Ok(VirtAddr(file.ehdr.e_entry as usize))
     }
 
 
@@ -326,7 +404,7 @@ impl Emulator {
         }
     }
 
-    pub fn run(&mut self, entry_point: Option<VirtAddr>) -> Option<()> {
+    pub fn run(&mut self, entry_point: Option<VirtAddr>) -> Result<(), EmuExit> {
         if entry_point.is_some() {
             self.set_reg(Register::Pc, entry_point.unwrap().0 as u64);
         }
@@ -447,10 +525,10 @@ impl Emulator {
                     let addr = VirtAddr(rs1_val.wrapping_add(imm) as usize);
 
                     match funct3 {
-                        /* SB */ 0b000 => self.memory.write(addr, rs2_val as u8),
-                        /* SH */ 0b001 => self.memory.write(addr, rs2_val as u16),
-                        /* SW */ 0b010 => self.memory.write(addr, rs2_val as u32),
-                        /* SD */ 0b011 => self.memory.write(addr, rs2_val as u64),
+                        /* SB */ 0b000 => self.memory.write(addr, rs2_val as u8)?,
+                        /* SH */ 0b001 => self.memory.write(addr, rs2_val as u16)?,
+                        /* SW */ 0b010 => self.memory.write(addr, rs2_val as u32)?,
+                        /* SD */ 0b011 => self.memory.write(addr, rs2_val as u64)?,
                         _ => unimplemented!("(Store) Unhandle funct3: {:#03b}", funct3),
                     };
                 }
@@ -612,11 +690,11 @@ impl Emulator {
                     match funct3 {
                         0b000 => {
                             // ECALL
-                            panic!("ECALL not implemented");
+                            return Err(EmuExit::Syscall);
                         },
                         0b001 => {
                             // EBREAK
-                            panic!("EBREAK not implemented");
+                            unimplemented!("EBREAK not implemented");
                         },
                         _ => unimplemented!("(ECALL/EBREAK) Unhandle funct3: {:#03b}", funct3),
                     }
