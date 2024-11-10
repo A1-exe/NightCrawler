@@ -114,7 +114,7 @@ pub enum MmuError {
     // Return error that address is invalid
     InvalidAddr(VirtAddr),
     // Return error that permissions are invalid
-    InvalidPerms(Perm, VirtAddr, usize),
+    InvalidPerms(Perm, VirtAddr, usize, Perm),
     // Return error that address overflowed
     AddressOverflow(VirtAddr, usize),
     // Return error that MMU is out of memory
@@ -248,6 +248,18 @@ impl Mmu {
         Ok(())
     }
 
+    pub fn peek(&self, addr: VirtAddr, size: usize, expected_perms: Perm) -> Result<&[u8], MmuError> {
+        let perms = self.permissions.get(addr.0..addr.0.checked_add(size).ok_or(MmuError::AddressOverflow(addr, size))?).unwrap();
+        
+        for (offset, &p) in perms.iter().enumerate() {
+            if (p.0 & expected_perms.0) != expected_perms.0 {
+                return Err(MmuError::InvalidPerms(expected_perms, VirtAddr(addr.0 + offset), size, p));
+            }
+        }
+
+        Ok(&self.memory[addr.0..addr.0.checked_add(size).ok_or(MmuError::AddressOverflow(addr, size))?])
+    }
+
     // Write from `buf` to `addr`
     // Admin is a special permission that allows writing to non-living allocations
     pub fn write_from(&mut self, addr: VirtAddr, buf: &[u8]) -> Result<(), MmuError> {
@@ -261,7 +273,7 @@ impl Mmu {
         for (offset, &p) in perms.iter().enumerate() {
             if (p.0 & PermBit::Write as u8) == 0 {
                 println!("Attempt to write to non-writable memory at offset 0x{:X} of addr 0x{:X} (@0x{:X}", offset, addr.0, addr.0 + offset);
-                return Err(MmuError::InvalidPerms(Perm(PermBit::Write as u8), addr, buf.len()));
+                return Err(MmuError::InvalidPerms(Perm(PermBit::Write as u8), addr, buf.len(), p));
             }
 
             is_raw |= (p.0 & PermBit::ReadAfterWrite as u8) != 0;
@@ -301,8 +313,12 @@ impl Mmu {
     pub fn read_with_perms(&self, addr: VirtAddr, buf: &mut [u8], expected_perm: Perm) -> Result<(), MmuError> {
         // Check if any bytes aren't readable
         let perms = self.permissions.get(addr.0..addr.0.checked_add(buf.len()).ok_or(MmuError::AddressOverflow(addr, buf.len()))?).unwrap();
-        if expected_perm.0 != (PermBit::Unknown as u8) && perms.iter().any(|p| (p.0 & expected_perm.0) == 0) {
-            return Err(MmuError::InvalidPerms(Perm(PermBit::Read as u8), addr, buf.len()));
+        if expected_perm.0 != (PermBit::Unknown as u8) {
+            for (offset, &p) in perms.iter().enumerate() {
+                if (p.0 & expected_perm.0) == 0 {
+                    return Err(MmuError::InvalidPerms(expected_perm, VirtAddr(addr.0 + offset), buf.len(), p));
+                }
+            }
         }
 
         buf.copy_from_slice(&self.memory.get(addr.0..addr.0.checked_add(buf.len()).ok_or(MmuError::AddressOverflow(addr, buf.len()))?)

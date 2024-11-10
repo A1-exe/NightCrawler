@@ -219,6 +219,8 @@ pub enum EmuExit {
     LoadError(String),
     // Exit due to syscall
     Syscall,
+    // Error handling syscall,
+    SyscallError(String),
     // Clean exit
     Exit,
     // Read/write caused overflow of address space
@@ -237,19 +239,19 @@ impl From<MmuError> for EmuExit {
     fn from(err: MmuError) -> Self {
         match err {
             MmuError::InvalidAddr(addr) => EmuExit::InvalidAccess(addr, 0),
-            MmuError::InvalidPerms(Perm(perm), addr, size) => {
+            MmuError::InvalidPerms(Perm(exp_perm), addr, size, Perm(real_perm)) => {
                 let read = PermBit::Read as u8;
                 let write = PermBit::Write as u8;
                 let raw = PermBit::ReadAfterWrite as u8;
 
-                if perm & raw != 0 {
+                if exp_perm & raw != 0 {
                     EmuExit::UninitRead(addr)
-                } else if perm & read == 0 {
+                } else if exp_perm & read == 0 {
                     EmuExit::ReadFault(addr)
-                } else if perm & write == 0 {
+                } else if exp_perm & write == 0 {
                     EmuExit::WriteFault(addr)
                 } else {
-                    panic!("InvalidPerms: {:#X} {:#X} {:#X}", perm, addr.0, size)
+                    panic!("InvalidPerms: {:#X} {:#X} {:#X} {:#X}", exp_perm, addr.0, size, real_perm)
                 }
             }
             MmuError::AddressOverflow(addr, size) => EmuExit::AddressOverflow(addr, size),
@@ -404,15 +406,11 @@ impl Emulator {
         }
     }
 
-    pub fn run(&mut self, entry_point: Option<VirtAddr>) -> Result<(), EmuExit> {
-        if entry_point.is_some() {
-            self.set_reg(Register::Pc, entry_point.unwrap().0 as u64);
-        }
-
+    pub fn run(&mut self) -> Result<(), EmuExit> {
         'next_inst: loop {
             // Fetch program counter
             let pc = self.reg(Register::Pc);
-            println!("PC: {:#X}", pc);
+            // println!("PC: {:#X}", pc);
 
             let instr = self.memory.read::<u32>(VirtAddr(pc as usize))?;
 
@@ -454,7 +452,7 @@ impl Emulator {
                             let rd = itype.rd;
                             let rs1_val = self.reg(rs1);
                             let target = rs1_val.wrapping_add(imm);
-                            println!("JALR: target = {:#X}", target);
+                            // println!("JALR: target = {:#X}", target);
                             self.set_reg(rd, pc.wrapping_add(4));
                             self.set_reg(Register::Pc, target);
                             continue 'next_inst;
