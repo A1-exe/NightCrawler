@@ -3,8 +3,10 @@ pub mod mmu;
 
 use emu::{EmuExit, Emulator, FileType, Register};
 use mmu::{Perm, PermBit, VirtAddr};
+use nightcrawler::{rdstc, set_thread_affinity};
 
-use std::io::Write;
+use std::{io::Write, sync::{Arc, Mutex}, time::Duration};
+
 #[allow(unused)]
 use std::time::Instant;
 
@@ -14,6 +16,40 @@ macro_rules! pause {
         std::io::stdin().read_line(&mut String::new()).expect("Failed to read line");
     };
 }
+
+// Track input corpus in memory
+struct Corpus {
+    inputs: Vec<Vec<u8>>,
+}
+
+// Mutate an input
+enum Mutator {
+    Unimplemented
+}
+
+#[derive(Default)]
+struct FuzzStats {
+    // Total caces
+    cases: u64,
+    
+    // Total crashes
+    crashes: u64,
+
+    // Total cycles
+    cycles: u64,
+    
+    // Total cycles during reset
+    reset_cycles: u64,
+
+    // Total cycles during run
+    run_cycles: u64,
+
+    // Total instructions
+    instrs: u64,
+}
+
+const STATS_INTERVAL: u64 = 1; // In cases
+const NUMBER_OF_WORKERS: usize = 2; // In cores
 
 fn main() {
     let mut emu = Emulator::new(32 * 1024 * 1024);
@@ -48,16 +84,63 @@ fn main() {
     // println!("Reading from top of stack: {:#X?}", ntmp);
     // pause!();
 
+    let arc_emu = Arc::new(emu);
+    let arc_corpus = Arc::new(Corpus {
+        inputs: Vec::new()
+    });
+    let arc_stats = Arc::new(Mutex::new(FuzzStats::default()));
+
+    for thread_id in 0..NUMBER_OF_WORKERS {
+        let emu = arc_emu.clone();
+        let corpus = arc_corpus.clone();
+        let stats = arc_stats.clone();
+
+        std::thread::spawn(move || {
+            worker(thread_id, emu, corpus, stats);
+        });
+    }
+
+    let start = Instant::now();
+    loop {
+        // Output stats 
+        std::thread::sleep(std::time::Duration::from_millis(1000));
+
+        let stats = arc_stats.lock().unwrap();
+        let elapsed = start.elapsed().as_secs_f64();
+
+        let cases_per = stats.cases as f64 / elapsed;
+        let total_cycles = stats.cycles as f64;
+        let reset_cycles_per = stats.reset_cycles as f64 / total_cycles;
+        let run_cycles_per = stats.run_cycles as f64 / total_cycles;
+        let instrs_per = stats.instrs as f64 / elapsed;
+        
+        println!("[{:10.6}] cases {:6} | crashes {:6} \
+            | fcps {:8.2} | reset {:6.2} | run {:6.2} \
+            | {:8.2} inst/s", 
+            elapsed, stats.cases, stats.crashes, 
+            cases_per, reset_cycles_per, run_cycles_per,
+            instrs_per
+        );
+    }
+}
+
+fn worker(thread_id: usize, base_emu: Arc<Emulator>, corpus: Arc<Corpus>, stats: Arc<Mutex<FuzzStats>>) {
+    // Pin thread to core
+    set_thread_affinity(thread_id)
+        .expect(&format!("Failed to set thread affinity. TID: {:?}", thread_id));
+
     // Copy the real 
-    let mut fuzz_case = emu.fork();
+    let mut fuzz_case = base_emu.fork();
 
     // Use seeded RNG for testing
-    let mut rng = nightcrawler::Rng::new();
+    let mut rng = nightcrawler::Rng::new_with_seed(rdstc());
 
-    let mut total_cases = 0u64;
-    let start = Instant::now();
+    let mut local_stats = FuzzStats::default();
+
+    println!("Worker {} started", thread_id);
 
     // Begin fuzzing
+    let mut batch_start = rdstc();
     loop {
         // Setup file for fuzzing stdin
         // This is the first file descriptor, so it will be stdin
@@ -68,15 +151,15 @@ fn main() {
         if let Some(Some(file)) = fuzz_case.files.get_mut(fd) {
             // We don't have a valid corpus management system yet
             // We will just generate random bytes of random length for now
-            // let len = rng.rng() % 100;
-            // let mut data = Vec::with_capacity(len);
-            // for _ in 0..len {
-            //     data.push(rng.rng() as u8);
-            // }
+            let len = rng.rng() % 100;
+            let mut data = Vec::with_capacity(len);
+            for _ in 0..len {
+                data.push(rng.rng() as u8);
+            }
 
             // Hardcoded testcase for testing
-            let mut data = Vec::new();
-            data.extend_from_slice(&[0x41, 0x42, 0x43, 0x44, 0x45, 0x46]);
+            // let mut data = Vec::new();
+            // data.extend_from_slice(&[0x41, 0x42, 0x43, 0x44, 0x45, 0x46]);
 
             file.data = Some(data);
         } else {
@@ -84,8 +167,10 @@ fn main() {
         }
 
         // Run testcase until completion
+        let run_start = rdstc();
         loop {
-            let vmexit = fuzz_case.run().expect_err("Failed to run emulator");
+            let vmexit = fuzz_case.run(&mut local_stats).expect_err("Failed to run emulator");
+
             match vmexit {
                 EmuExit::Syscall => {
                     if let Err(e) = handle_sys(&mut fuzz_case) {
@@ -103,22 +188,25 @@ fn main() {
                     break;
                 },
                 EmuExit::ReadFault(addr) => {
-                    println!("Input caused crash!");
-                    println!("{:#x?}", fuzz_case);
-                    println!("Read fault at: 0x{:X}", addr.0);
-                    return;
+                    // println!("Input caused crash!");
+                    // println!("{:#x?}", fuzz_case);
+                    // println!("Read fault at: 0x{:X}", addr.0);
+                    local_stats.crashes = local_stats.crashes.wrapping_add(1);
+                    break;
                 },
                 EmuExit::WriteFault(addr) => {
-                    println!("Input caused crash!");
-                    println!("{:#x?}", fuzz_case);
-                    println!("Write fault at: 0x{:X}", addr.0);
-                    return;
+                    // println!("Input caused crash!");
+                    // println!("{:#x?}", fuzz_case);
+                    // println!("Write fault at: 0x{:X}", addr.0);
+                    local_stats.crashes = local_stats.crashes.wrapping_add(1);
+                    break;
                 },
                 EmuExit::UninitFault(addr) => {
-                    println!("Input caused crash!");
-                    println!("{:#x?}", fuzz_case);
-                    println!("Uninit fault at: 0x{:X}", addr.0);
-                    return;
+                    // println!("Input caused crash!");
+                    // println!("{:#x?}", fuzz_case);
+                    // println!("Uninit fault at: 0x{:X}", addr.0);
+                    local_stats.crashes = local_stats.crashes.wrapping_add(1);
+                    break;
                 },
                 _ => {
                     println!("Unexpected vmexit: {:?}", vmexit);
@@ -126,33 +214,33 @@ fn main() {
                 }
             }
         }
-        
+        local_stats.run_cycles += rdstc() - run_start;
         
         // Reset emulator for next testcase
-        fuzz_case.reset(&emu);
+        let reset_start = rdstc();
+        fuzz_case.reset(&base_emu);
+        local_stats.reset_cycles += rdstc() - reset_start;
         
-        total_cases = total_cases.wrapping_add(1);
-        if total_cases % 100 == 0 {
-            let elapsed = start.elapsed().as_secs_f64();
-            println!("[{:10.6}] cases {:10} | fcps {:10.2}", elapsed, total_cases, total_cases as f64 / elapsed);
+        local_stats.cases = local_stats.cases.wrapping_add(1);
+        
+        // Report stats periodically
+        if (local_stats.cases % STATS_INTERVAL) == 0 {
+            let mut stats = stats.lock().unwrap();
+
+            stats.cases += local_stats.cases;
+            stats.crashes += local_stats.crashes;
+            stats.reset_cycles += local_stats.reset_cycles;
+            stats.run_cycles += local_stats.run_cycles;
+            stats.instrs += local_stats.instrs;
+
+            let batch_end = rdstc();
+            stats.cycles += batch_end - batch_start;
+            batch_start = batch_end;
+
+            // Reset local stats structure
+            local_stats = FuzzStats::default();
         }
     }
-
-    // let tmp = emu.memory.alloc(6).unwrap();
-    // let forked = emu.fork();
-    // let mut total_cases = 0u64;
-    // let start = Instant::now();
-
-    // for case in 0..100_000_000 {
-    //     emu.memory.write_from(tmp, b"meeper").expect("write failed");
-    //     emu.reset(&forked);
-    //     total_cases = total_cases.wrapping_add(1);
-
-    //     if total_cases % 10_000 == 0 {
-    //         let elapsed = start.elapsed().as_secs_f64();
-    //         println!("[{:10.6}] cases {:10} | fcps {:10.2}", elapsed, total_cases, total_cases as f64 / elapsed);
-    //     }
-    // }
 }
 
 fn handle_sys(emu: &mut Emulator) -> Result<(), EmuExit> {

@@ -1,6 +1,6 @@
 
 use core::fmt;
-use crate::mmu::{Mmu, VirtAddr, Perm, PermBit, MmuError};
+use crate::{mmu::{Mmu, MmuError, Perm, PermBit, VirtAddr}, FuzzStats};
 
 // An R-type instruction
 #[derive(Debug)]
@@ -452,10 +452,12 @@ impl Emulator {
         }
     }
 
-    pub fn run(&mut self) -> Result<(), EmuExit> {
+    pub fn run(&mut self, stats: &mut FuzzStats) -> Result<(), EmuExit> {
         'next_inst: loop {
             // Fetch program counter
             let pc = self.reg(Register::Pc);
+            stats.instrs += 1;
+            
             // println!("PC: {:#X}", pc);
             // println!("{:#x?}", self);
 

@@ -35,6 +35,56 @@ unsafe impl Prim for i64   {}
 unsafe impl Prim for i128  {}
 unsafe impl Prim for isize {}
 
+// OS-agnostic rdstc
+pub fn rdstc() -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    unsafe { std::arch::x86_64::_rdtsc() }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        unimplemented!("rdstc is only supported on x86_64");
+    }
+}
+
+// OS-agnostic set affinity
+#[cfg(unix)]
+pub fn set_thread_affinity(core: usize) -> Result<(), ()> {
+    extern "system" {
+        fn sched_setaffinity(pid: usize, cpusetsize: usize, mask: *const usize) -> i32;
+    }
+
+    const USIZE_BITS: usize = core::mem::size_of::<usize>() * 8;
+
+    let mut mask = [0usize; 32];
+    mask[core / USIZE_BITS] |= 1 << (core % USIZE_BITS);
+
+    unsafe {
+        if sched_setaffinity(0, std::mem::size_of_val(&mask), mask.as_ptr()) == 0 {
+            Ok(())
+        } else {
+            Err(())
+        }
+    }
+}
+
+#[cfg(windows)]
+pub fn set_thread_affinity(core: usize) -> Result<(), ()> {
+    extern "system" {
+        fn GetCurrentThread() -> usize;
+        fn SetThreadAffinityMask(hThread: usize, dwThreadAffinityMask: usize) -> usize;
+    }
+
+    assert!(core < 64, "Windows only supports 64 cores");
+
+    unsafe {
+        if SetThreadAffinityMask(GetCurrentThread(), 1usize << core) != 0 {
+            Ok(())
+        } else {
+            Err(())
+        }
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
