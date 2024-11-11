@@ -242,12 +242,13 @@ impl Mmu {
     // Set permissions for a region of memory
     pub fn set_perms(&mut self, addr: VirtAddr, size: usize, perm: Perm) -> Result<(), MmuError> {
         self.permissions.get_mut(addr.0..addr.0.checked_add(size).ok_or(MmuError::AddressOverflow(addr, size))?)
-            .ok_or(MmuError::MetaError("Could not get_mut permissions".to_string()))?
+            .ok_or(MmuError::InvalidPerms(perm, addr, size, Perm(PermBit::Unknown as u8)))? // Attempt to access unallocated memory
             .iter_mut()
             .for_each(|p| *p = perm);
         Ok(())
     }
 
+    // An administrative function for reading vm memory without permission checks
     pub fn peek(&self, addr: VirtAddr, size: usize, expected_perms: Perm) -> Result<&[u8], MmuError> {
         let perms = self.permissions.get(addr.0..addr.0.checked_add(size).ok_or(MmuError::AddressOverflow(addr, size))?).unwrap();
         
@@ -265,7 +266,7 @@ impl Mmu {
     pub fn write_from(&mut self, addr: VirtAddr, buf: &[u8]) -> Result<(), MmuError> {
         // Check permissions for all bytes
         let perms = self.permissions.get_mut(addr.0..addr.0.checked_add(buf.len()).ok_or(MmuError::AddressOverflow(addr, buf.len()))?)
-            .ok_or(MmuError::MetaError("Could not get_mut permissions".to_string()))?;
+            .ok_or(MmuError::InvalidPerms(Perm(PermBit::Write as u8), addr, buf.len(), Perm(PermBit::Unknown as u8)))?; // Attempt to access unallocated memory
 
         // Check if all bytes are writable
         // Check if any bytes are ReadAfterWrite
@@ -312,7 +313,8 @@ impl Mmu {
     // Read from `addr` into `buf` with expected permissions
     pub fn read_with_perms(&self, addr: VirtAddr, buf: &mut [u8], expected_perm: Perm) -> Result<(), MmuError> {
         // Check if any bytes aren't readable
-        let perms = self.permissions.get(addr.0..addr.0.checked_add(buf.len()).ok_or(MmuError::AddressOverflow(addr, buf.len()))?).unwrap();
+        let perms = self.permissions.get(addr.0..addr.0.checked_add(buf.len()).ok_or(MmuError::AddressOverflow(addr, buf.len()))?)
+            .ok_or(MmuError::InvalidPerms(Perm(PermBit::Read as u8), addr, buf.len(), Perm(PermBit::Unknown as u8)))?; // Attempt to access unallocated memory
         if expected_perm.0 != (PermBit::Unknown as u8) {
             for (offset, &p) in perms.iter().enumerate() {
                 if (p.0 & expected_perm.0) == 0 {
