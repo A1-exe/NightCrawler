@@ -262,7 +262,7 @@ pub enum EmuExit {
     // Read/write to memory with invalid permissions
     ReadFault(VirtAddr),
     // Read of uninitialized memory
-    UninitRead(VirtAddr),
+    UninitFault(VirtAddr),
     // Write to non-writable memory
     WriteFault(VirtAddr),
 }
@@ -275,9 +275,11 @@ impl From<MmuError> for EmuExit {
                 let read = PermBit::Read as u8;
                 let write = PermBit::Write as u8;
                 let raw = PermBit::ReadAfterWrite as u8;
+                let unknown = PermBit::Unknown as u8;
 
-                if exp_perm & raw != 0 {
-                    EmuExit::UninitRead(addr)
+                // println!("Converting Perms: {:#X} {:#X} {:#X} {:#X}", exp_perm, addr.0, size, real_perm);
+                if real_perm == unknown || exp_perm & raw != 0 {
+                    EmuExit::UninitFault(addr)
                 } else if exp_perm & read == 0 {
                     EmuExit::ReadFault(addr)
                 } else if exp_perm & write == 0 {
