@@ -1,6 +1,5 @@
 
 use core::fmt;
-
 use crate::mmu::{Mmu, VirtAddr, Perm, PermBit, MmuError};
 
 // An R-type instruction
@@ -213,6 +212,39 @@ macro_rules! pop {
     }
 }
 
+#[derive(Debug, Clone)]
+pub enum FileType {
+    FuzzInput,
+    Unimplemented
+}
+
+#[derive(Debug, Clone)]
+pub struct File {
+    pub r#type: FileType,
+
+    // File data
+    pub data: Option<Vec<u8>>,
+
+    // Cursor for seeking
+    pub offset: Option<usize>,
+}
+
+impl File {
+    pub fn new(r#type: FileType) -> Self {
+        match r#type {
+            FileType::FuzzInput => {
+                Self {
+                    r#type,
+                    data: Some(Vec::new()),
+                    offset: Some(0),
+                }
+            }
+            _ => unimplemented!("Non-fuzz input file types are not yet supported"),
+        }
+    }
+}
+
+
 #[derive(Debug)]
 pub enum EmuExit {
     // Error loading program
@@ -265,6 +297,8 @@ impl From<MmuError> for EmuExit {
 pub struct Emulator {
     pub memory: Mmu,
     registers: [u64; 33],
+    pub files: Vec<Option<File>>,
+
 }
 
 impl fmt::Debug for Emulator {
@@ -313,6 +347,7 @@ impl Emulator {
         Self {
             memory: Mmu::new(size),
             registers: [0; 33],
+            files: Vec::new(),
         }
     }
 
@@ -321,13 +356,22 @@ impl Emulator {
         Self {
             memory: self.memory.fork(),
             registers: self.registers,
+            files: self.files.clone(),
         }
+    }
+    
+    // Create a new file
+    pub fn new_file(&mut self, r#type: FileType) -> usize {
+        let file = File::new(r#type);
+        self.files.push(Some(file));
+        self.files.len() - 1
     }
 
     // Reset the emulator to the state of another emulator
     pub fn reset(&mut self, other: &Self) {
         self.memory = other.memory.fork();
         self.registers = other.registers;
+        self.files = other.files.clone();
     }
 
     // Load a program into memory
@@ -411,6 +455,7 @@ impl Emulator {
             // Fetch program counter
             let pc = self.reg(Register::Pc);
             // println!("PC: {:#X}", pc);
+            // println!("{:#x?}", self);
 
             let instr = self.memory.read::<u32>(VirtAddr(pc as usize))?;
 
@@ -649,20 +694,18 @@ impl Emulator {
 
                     let val = match funct3 {
                         0b000 => {
-                            let mode = (funct7 >> 5) & 0b1111111;
-                            match mode {
+                            match funct7 {
                                 /* ADDW */ 0b0000000 => rs1_val.wrapping_add(rs2_val) as i32 as i64 as u64,
                                 /* SUBW */ 0b0100000 => rs1_val.wrapping_sub(rs2_val) as i32 as i64 as u64,
-                                _ => unreachable!("(ADDW/SUBW) Unhandle mode: {:#07b}", mode),
+                                _ => unreachable!("(ADDW/SUBW) Unhandle mode: {:#07b}", funct7),
                             }
                         }
                         /* SLLW */ 0b001 => rs1_val << (rs2_val & 0b11111) as i32 as i64 as u64,
                         /* SRLW */ 0b101 => {
-                            let mode = (funct7 >> 5) & 0b1111111;
-                            match mode {
+                            match funct7 {
                                 /* SRLW */ 0b0000000 => rs1_val >> (rs2_val & 0b11111) as i32 as i64 as u64,
                                 /* SRAW */ 0b0100000 => ((rs1_val as i32) >> (rs2_val & 0b11111)) as i64 as u64,
-                                _ => unreachable!("(SRLW/SRAW) Unhandle mode: {:#07b}", mode),
+                                _ => unreachable!("(SRLW/SRAW) Unhandle mode: {:#07b}", funct7),
                             }
                         }
                         _ => unimplemented!("(R4-Type) Unhandle funct3: {:#03b}", funct3),
