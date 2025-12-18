@@ -3,7 +3,7 @@ pub mod mmu;
 
 use emu::{EmuExit, Emulator, FileType, Register};
 use mmu::{Perm, PermBit, VirtAddr};
-use nightcrawler::{rdstc, set_thread_affinity};
+use nightcrawler::{Rng, rdstc, set_thread_affinity};
 
 use std::{io::Write, sync::{Arc, Mutex}, time::Duration};
 
@@ -88,15 +88,17 @@ fn main() {
     let arc_corpus = Arc::new(Corpus {
         inputs: Vec::new()
     });
+    let arc_rng = Arc::new(Mutex::new(nightcrawler::Rng::new_with_seed(rdstc())));
     let arc_stats = Arc::new(Mutex::new(FuzzStats::default()));
 
     for thread_id in 0..NUMBER_OF_WORKERS {
         let emu = arc_emu.clone();
         let corpus = arc_corpus.clone();
+        let rng = arc_rng.clone();
         let stats = arc_stats.clone();
 
         std::thread::spawn(move || {
-            worker(thread_id, emu, corpus, stats);
+            worker(thread_id, emu, corpus, rng, stats);
         });
     }
 
@@ -124,16 +126,13 @@ fn main() {
     }
 }
 
-fn worker(thread_id: usize, base_emu: Arc<Emulator>, corpus: Arc<Corpus>, stats: Arc<Mutex<FuzzStats>>) {
+fn worker(thread_id: usize, base_emu: Arc<Emulator>, corpus: Arc<Corpus>, rng: Arc<Mutex<Rng>>, stats: Arc<Mutex<FuzzStats>>) {
     // Pin thread to core
     set_thread_affinity(thread_id)
         .expect(&format!("Failed to set thread affinity. TID: {:?}", thread_id));
 
     // Copy the real 
     let mut fuzz_case = base_emu.fork();
-
-    // Use seeded RNG for testing
-    let mut rng = nightcrawler::Rng::new_with_seed(rdstc());
 
     let mut local_stats = FuzzStats::default();
 
@@ -151,11 +150,20 @@ fn worker(thread_id: usize, base_emu: Arc<Emulator>, corpus: Arc<Corpus>, stats:
         if let Some(Some(file)) = fuzz_case.files.get_mut(fd) {
             // We don't have a valid corpus management system yet
             // We will just generate random bytes of random length for now
+            let mut rng = rng.lock().unwrap();
             let len = rng.rng() % 100;
+            // println!("ID: {}, Len: {}", thread_id, len);
             let mut data = Vec::with_capacity(len);
             for _ in 0..len {
                 data.push(rng.rng() as u8);
             }
+
+            // Test one byte
+            // let mut rng = rng.lock().unwrap();
+            // let mut data: Vec<u8> = Vec::new();
+            // data.extend_from_slice(&[0x41, 0x42, 0x43, 0x44, 0x45]);
+            // let testbyte = rng.rng() as u8;
+            // data.push(testbyte);
 
             // Hardcoded testcase for testing
             // let mut data = Vec::new();
